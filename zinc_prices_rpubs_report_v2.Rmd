@@ -1,6 +1,6 @@
 ---
-title: "Institutional-Grade Zinc Price Forecasting (1990-2025)"
-author: "Data Science Research"
+title: "Econometric Time-Series Forecasting of Zinc Prices (1990-2025): ARIMA Modeling and Statistical Diagnostics"
+author: "Tymoteusz Pawełczyk"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
   html_document:
