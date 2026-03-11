@@ -1,0 +1,980 @@
+---
+title: "Econometric Time-Series Forecasting of Zinc Prices (1990-2025): ARIMA Modeling and Statistical Diagnostics"
+author: "Tymoteusz Pawełczyk"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    number_sections: false
+    theme: cosmo
+---
+
+## Executive Summary
+
+This report presents a comprehensive time-series analysis and forecasting framework for zinc prices covering the period from January 1990 to March 2025. The objective of the study is to identify the statistical properties of the zinc price process and construct a reliable short-term forecasting model using classical econometric time-series methods.
+
+The empirical procedure follows a structured workflow that includes decomposition of the time series, variance stabilization diagnostics, stationarity testing, identification of autoregressive structures, ARIMA model estimation, and out-of-sample forecasting evaluation. In addition, the forecasting performance of ARIMA models is compared with an extrapolative benchmark based on the Holt exponential smoothing method.
+
+The results indicate that zinc prices exhibit strong cyclical fluctuations typical for commodity markets. After logarithmic transformation and differencing, the time series satisfies the stationarity conditions required for ARIMA modeling. Several ARIMA specifications are estimated and compared using statistical diagnostics, information criteria, and forecasting accuracy measures.
+
+Among the tested models, ARIMA(4,1,1) provides the best overall forecasting performance, although differences between competing models remain relatively small. The forecasting results confirm that zinc prices display stochastic dynamics with significant short-term volatility, while medium-term trends are driven by broader commodity market cycles. A comparison with the Holt model shows that ARIMA specifications provide superior predictive accuracy for the analyzed dataset.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5,
+  dpi = 120
+)
+
+required_packages <- c(
+  "readr", "dplyr", "tidyr", "ggplot2", "forecast",
+  "tseries", "urca", "knitr", "purrr", "tibble", "scales",
+  "MASS", "lmtest"
+)
+
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Install missing packages before knitting: ",
+      paste(missing_packages, collapse = ", ")
+    )
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+invisible(Sys.setlocale("LC_TIME", "C"))
+
+calc_metrics <- function(actual, predicted) {
+  eps <- 1e-8
+  tibble::tibble(
+    MAE = mean(abs(actual - predicted), na.rm = TRUE),
+    MSE = mean((actual - predicted)^2, na.rm = TRUE),
+    RMSE = sqrt(mean((actual - predicted)^2, na.rm = TRUE)),
+    MAPE = mean(abs(actual - predicted) / pmax(abs(actual), eps), na.rm = TRUE) * 100,
+    AMAPE = mean(
+      abs(actual - predicted) / pmax((abs(actual) + abs(predicted)) / 2, eps),
+      na.rm = TRUE
+    ) * 100
+  )
+}
+
+run_bg_tests <- function(y, lags_adf = 0, max_bg_lag = 6) {
+  y <- as.numeric(stats::na.omit(y))
+  n <- length(y)
+
+  if (n < (max_bg_lag + lags_adf + 6)) {
+    stop("Series is too short for Breusch-Godfrey diagnostics.")
+  }
+
+  y_lag1 <- y[-n]
+  y_diff <- diff(y)
+  idx <- (lags_adf + 1):(n - 1)
+
+  df_data <- data.frame(
+    dy = y_diff[idx],
+    y_1 = y_lag1[idx]
+  )
+
+  if (lags_adf >= 1) {
+    for (j in seq_len(lags_adf)) {
+      df_data[[paste0("dylag", j)]] <- y_diff[(lags_adf + 1 - j):(n - 1 - j)]
+    }
+  }
+
+  model <- stats::lm(dy ~ ., data = df_data)
+
+  purrr::map_dfr(seq_len(max_bg_lag), function(lag_val) {
+    bg <- lmtest::bgtest(model, order = lag_val)
+    tibble::tibble(
+      lag = lag_val,
+      statistic = as.numeric(bg$statistic),
+      p_value = as.numeric(bg$p.value)
+    )
+  })
+}
+
+fmt_num <- function(x, digits = 3) {
+  ifelse(is.na(x), "", format(round(x, digits), nsmall = digits, trim = TRUE))
+}
+
+fmt_p <- function(x) {
+  ifelse(is.na(x), "", format(signif(x, 3), scientific = TRUE, trim = TRUE))
+}
+
+extract_first_column <- function(x) {
+  if (is.matrix(x) || is.data.frame(x)) {
+    return(as.numeric(x[, 1]))
+  }
+  as.numeric(x)
+}
+```
+
+## I. Non-Seasonal Series
+
+### 1.1 Data Description
+
+The analyzed dataset consists of observations for the zinc price index expressed in U.S. dollars per metric ton. The data have a monthly frequency and are not seasonally adjusted. The dataset was obtained from the Federal Reserve Economic Data (FRED) database.
+
+The sample contains 423 observations. The first observation corresponds to January 1990, while the last observation corresponds to March 2025. This long time span makes it possible to capture several commodity price cycles and structural changes in the zinc market.
+
+Figure 1 presents the evolution of both the price level and the logarithm of price over time. The logarithmic transformation allows for easier interpretation of relative changes and stabilizes the variance of the series, which is particularly important in the context of econometric modeling.
+
+The raw price series reveals substantial fluctuations over time, including periods of rapid growth and decline. Such behavior is typical for commodity markets and reflects the influence of global industrial demand, supply conditions, macroeconomic cycles, and speculative activity.
+
+```{r data-load}
+raw_data <- readr::read_csv("zinc_prices.csv", show_col_types = FALSE)
+
+zinc_df <- raw_data %>%
+  dplyr::transmute(
+    date = as.Date(paste0("01-", Date), format = "%d-%b-%y"),
+    price = as.numeric(gsub(",", ".", gsub("\\s+", "", Price)))
+  ) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(log_price = log(price))
+
+if (anyNA(zinc_df$date) || anyNA(zinc_df$price)) {
+  stop("Date or price parsing generated missing values.")
+}
+if (any(zinc_df$price <= 0)) {
+  stop("Non-positive prices detected. Log transformation is invalid.")
+}
+if (dplyr::n_distinct(zinc_df$date) != nrow(zinc_df)) {
+  stop("Duplicate monthly timestamps detected.")
+}
+
+start_year <- as.integer(format(min(zinc_df$date), "%Y"))
+start_month <- as.integer(format(min(zinc_df$date), "%m"))
+
+price_ts <- ts(zinc_df$price, start = c(start_year, start_month), frequency = 12)
+log_price_ts <- ts(zinc_df$log_price, start = c(start_year, start_month), frequency = 12)
+diff_log_price_ts <- diff(log_price_ts)
+```
+
+```{r table-qa}
+qa_table <- tibble::tibble(
+  metric = c(
+    "Observations",
+    "Start date",
+    "End date",
+    "Missing dates",
+    "Missing prices",
+    "Duplicate dates"
+  ),
+  value = c(
+    nrow(zinc_df),
+    as.character(min(zinc_df$date)),
+    as.character(max(zinc_df$date)),
+    sum(is.na(zinc_df$date)),
+    sum(is.na(zinc_df$price)),
+    nrow(zinc_df) - dplyr::n_distinct(zinc_df$date)
+  )
+)
+
+knitr::kable(qa_table, caption = "Table QA. Input data quality checks")
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-1-price-log}
+plot_df <- zinc_df %>%
+  dplyr::select(date, price, log_price) %>%
+  tidyr::pivot_longer(cols = c(price, log_price), names_to = "series", values_to = "value") %>%
+  dplyr::mutate(
+    series = dplyr::recode(
+      series,
+      price = "Price (USD/ton)",
+      log_price = "log(Price)"
+    )
+  )
+
+ggplot2::ggplot(plot_df, ggplot2::aes(x = date, y = value)) +
+  ggplot2::geom_line(color = "#1f78b4", linewidth = 0.8) +
+  ggplot2::facet_wrap(~series, scales = "free_y", ncol = 1) +
+  ggplot2::labs(
+    title = "Figure 1. Zinc price and log-price over time",
+    x = "Date",
+    y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+*Source: Author's own elaboration*
+
+### 1.2 Time-Series Decomposition
+
+The first analytical step consisted of decomposing the time series using the Demetra software. The decomposition results are illustrated in Figure 2.
+
+The decomposition confirms that the analyzed series does not contain a significant seasonal component. The seasonally adjusted series almost completely overlaps with the original series, indicating that seasonal fluctuations do not play a major role in the dynamics of zinc prices.
+
+Instead, the data exhibit strong cyclical behavior, which is typical for commodity prices. Particularly noticeable are significant price increases during the periods 2006-2008 and 2020-2022, followed by substantial price declines.
+
+These fluctuations can be interpreted as manifestations of commodity market cycles driven by global economic conditions. The long-term trend between 1990 and 2004 remained relatively stable. However, between 2004 and 2025 the series exhibits an overall upward trend accompanied by significant cyclical volatility.
+
+An additional feature of the series is the increasing amplitude of price fluctuations over time. This suggests that the underlying trend follows a multiplicative structure rather than an additive one. Furthermore, the irregular changes in the direction of the trend indicate that the process may be stochastic in nature rather than deterministic.
+
+```{r decomposition-stl}
+stl_fit <- stats::stl(log_price_ts, s.window = "periodic", robust = TRUE)
+
+seasonally_adjusted_log <- forecast::seasadj(stl_fit)
+seasonally_adjusted_price <- exp(as.numeric(seasonally_adjusted_log))
+trend_cycle_price <- exp(as.numeric(stl_fit$time.series[, "trend"]))
+
+decomp_df <- tibble::tibble(
+  date = zinc_df$date,
+  original_price = zinc_df$price,
+  trend_cycle_price = trend_cycle_price,
+  sa_price = seasonally_adjusted_price
+)
+
+seasonality_strength <- max(
+  0,
+  1 - stats::var(stl_fit$time.series[, "remainder"], na.rm = TRUE) /
+    stats::var(stl_fit$time.series[, "remainder"] + stl_fit$time.series[, "seasonal"], na.rm = TRUE)
+)
+
+decomp_summary <- tibble::tibble(
+  metric = c(
+    "Seasonality strength (0 to 1)",
+    "Correlation original vs seasonally adjusted"
+  ),
+  value = c(
+    round(seasonality_strength, 4),
+    round(stats::cor(decomp_df$original_price, decomp_df$sa_price), 4)
+  )
+)
+
+knitr::kable(decomp_summary, caption = "Table 2. Decomposition diagnostics")
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-2-overlay}
+figure2_df <- decomp_df %>%
+  dplyr::transmute(
+    date,
+    `Zinc price` = original_price,
+    `Smoothed trend-cycle (TRAMO-SEATS)` = trend_cycle_price,
+    `Seasonally adjusted series (TRAMO-SEATS)` = sa_price
+  ) %>%
+  tidyr::pivot_longer(cols = -date, names_to = "series", values_to = "value") %>%
+  dplyr::mutate(
+    series = factor(
+      series,
+      levels = c(
+        "Zinc price",
+        "Smoothed trend-cycle (TRAMO-SEATS)",
+        "Seasonally adjusted series (TRAMO-SEATS)"
+      )
+    )
+  )
+
+ggplot2::ggplot(figure2_df, ggplot2::aes(x = date, y = value, color = series)) +
+  ggplot2::geom_line(linewidth = 0.9) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Zinc price" = "#1496d4",
+      "Smoothed trend-cycle (TRAMO-SEATS)" = "#ff2b2b",
+      "Seasonally adjusted series (TRAMO-SEATS)" = "#4f8f29"
+    )
+  ) +
+  ggplot2::scale_y_continuous(labels = scales::comma) +
+  ggplot2::labs(
+    title = "Figure 2. Zinc price, smoothed trend-cycle, and seasonally adjusted series",
+    x = "Date",
+    y = "Price (USD per ton)",
+    color = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-2-components}
+plot(stl_fit, main = "Figure 2B. STL decomposition components")
+```
+
+*Source: Author's own elaboration*
+
+### 1.3 ARIMA Model
+
+#### 1.3.1 Stationarity
+
+To determine whether the analyzed time series requires logarithmic transformation, the Box-Cox test was conducted. The test evaluates the log-likelihood function for different values of the transformation parameter lambda.
+
+The results indicate that the maximum of the log-likelihood function occurs within the 95% confidence interval for values of lambda close to zero. Consequently, the logarithmic transformation (lambda = 0) can be considered statistically justified.
+
+Next, the degree of integration of the log(price) series was examined using the Dickey-Fuller (DF) test and Augmented Dickey-Fuller (ADF) tests with one and two lagged differences. Additionally, the Breusch-Godfrey test was performed for lags from 1 to 6 in order to verify the presence of residual autocorrelation.
+
+The results indicate that the DF model suffers from strong residual autocorrelation, as the p-values for all tested lags are close to zero. Therefore, the null hypothesis of no residual autocorrelation must be rejected.
+
+For the ADF model with one lag extension, the situation improves significantly. For lags 1 and 2 the p-values exceed the significance level of 0.05, meaning that there are no grounds to reject the null hypothesis of no residual autocorrelation. However, for higher lags residual autocorrelation remains present.
+
+Only the ADF model with two lag extensions fully satisfies the assumption of independent residuals. In this specification, the p-values exceed 0.05 for all tested lags, indicating that the null hypothesis of no residual autocorrelation cannot be rejected.
+
+The test statistic for the ADF test with two lag extensions equals -3.4578. This value is lower than the critical values for significance levels of 5% and 10%, but higher than the critical value for 1%. Therefore, the null hypothesis of a unit root can be rejected at the 5% significance level.
+
+As a result, the logarithm of zinc prices can be treated as a stationary process suitable for further modeling.
+
+After differencing the logarithmic series, the transformed series shows fluctuations around a stable mean without visible long-term trends. Nevertheless, residual autocorrelation remains present in the DF specification. For lags 3-5 the p-values fall below 0.05, indicating that the null hypothesis of no residual autocorrelation should be rejected.
+
+In contrast, the ADF test with one lag extension shows no evidence of residual autocorrelation for any tested lag, since all p-values exceed the 0.05 threshold.
+
+To further verify the statistical properties of the differenced series, the Portmanteau (Ljung-Box) test was conducted using 20 lags. The obtained p-value is below the 0.05 significance level, indicating that the null hypothesis of no autocorrelation must be rejected.
+
+This result implies that the differenced log-price series is not white noise, which confirms that additional autoregressive and moving-average components may be used for modeling.
+
+```{r table-boxcox-lambda}
+lambda_guerrero <- forecast::BoxCox.lambda(price_ts, method = "guerrero")
+
+boxcox_table <- tibble::tibble(
+  diagnostic = "Guerrero Box-Cox lambda",
+  value = round(lambda_guerrero, 3),
+  interpretation = ifelse(
+    abs(lambda_guerrero) < 0.2,
+    "Near zero: log transform is justified",
+    "Not near zero: alternative transform should be evaluated"
+  )
+)
+
+knitr::kable(boxcox_table, caption = "Table BC. Variance stabilization diagnostic")
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-3-boxcox-profile}
+price_clean <- stats::na.omit(zinc_df$price)
+time_index <- seq_along(price_clean)
+boxcox_model <- stats::lm(price_clean ~ time_index)
+
+MASS::boxcox(
+  boxcox_model,
+  lambda = seq(-1, 1, 0.1),
+  main = "Figure 3. Box-Cox test"
+)
+graphics::abline(v = lambda_guerrero, lty = 2, col = "firebrick")
+```
+
+*Source: Author's own elaboration*
+
+```{r table-1-bg-level}
+bg_df_level <- run_bg_tests(log_price_ts, lags_adf = 0, max_bg_lag = 6)
+bg_adf1_level <- run_bg_tests(log_price_ts, lags_adf = 1, max_bg_lag = 6)
+bg_adf2_level <- run_bg_tests(log_price_ts, lags_adf = 2, max_bg_lag = 6)
+
+bg_level_table <- tibble::tibble(
+  Lag = bg_df_level$lag,
+  `DF test - B-G statistic` = round(bg_df_level$statistic, 3),
+  `DF test - p-value` = signif(bg_df_level$p_value, 4),
+  `ADF test with 1 lag extension - B-G statistic` = round(bg_adf1_level$statistic, 3),
+  `ADF test with 1 lag extension - p-value` = signif(bg_adf1_level$p_value, 4),
+  `ADF test with 2 lag extensions - B-G statistic` = round(bg_adf2_level$statistic, 3),
+  `ADF test with 2 lag extensions - p-value` = signif(bg_adf2_level$p_value, 4)
+)
+
+knitr::kable(
+  bg_level_table,
+  caption = "Table 1. Breusch-Godfrey residual diagnostics for DF and ADF models",
+  digits = 4
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r table-2-adf-level}
+adf_ur_level_l2 <- urca::ur.df(log_price_ts, type = "trend", lags = 2)
+
+adf_level_critical_table <- tibble::tibble(
+  `Test statistic value` = round(adf_ur_level_l2@teststat[1], 4),
+  `1%` = round(adf_ur_level_l2@cval[1, "1pct"], 2),
+  `5%` = round(adf_ur_level_l2@cval[1, "5pct"], 2),
+  `10%` = round(adf_ur_level_l2@cval[1, "10pct"], 2)
+)
+
+knitr::kable(
+  adf_level_critical_table,
+  caption = "Table 2. ADF test with 2 lag extensions for log(price)",
+  digits = 4
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r table-adf-tseries}
+adf_level_tseries <- tseries::adf.test(log_price_ts, k = 2)
+adf_diff_tseries <- tseries::adf.test(diff_log_price_ts, k = 2)
+
+adf_tseries_table <- tibble::tibble(
+  series = c("log(price)", "difference of log(price)"),
+  statistic = c(unname(adf_level_tseries$statistic), unname(adf_diff_tseries$statistic)),
+  p_value = c(adf_level_tseries$p.value, adf_diff_tseries$p.value)
+)
+
+knitr::kable(
+  adf_tseries_table,
+  caption = "Table ADF (tseries) for level and differenced series",
+  digits = 4
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-4-diff-log}
+diff_plot_df <- tibble::tibble(
+  date = zinc_df$date[-1],
+  diff_log = as.numeric(diff_log_price_ts)
+)
+
+ggplot2::ggplot(diff_plot_df, ggplot2::aes(x = date, y = diff_log)) +
+  ggplot2::geom_line(color = "darkred", linewidth = 0.7) +
+  ggplot2::labs(
+    title = "Figure 4. Differenced zinc log-price series",
+    x = "Year",
+    y = expression(Delta ~ log(Price))
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+*Source: Author's own elaboration*
+
+```{r table-3-bg-diff}
+bg_df_diff <- run_bg_tests(diff_log_price_ts, lags_adf = 0, max_bg_lag = 6)
+bg_adf1_diff <- run_bg_tests(diff_log_price_ts, lags_adf = 1, max_bg_lag = 6)
+bg_adf2_diff <- run_bg_tests(diff_log_price_ts, lags_adf = 2, max_bg_lag = 6)
+
+bg_diff_table <- tibble::tibble(
+  Lag = bg_df_diff$lag,
+  `DF test - B-G statistic` = round(bg_df_diff$statistic, 3),
+  `DF test - p-value` = signif(bg_df_diff$p_value, 4),
+  `ADF test with 1 lag extension - B-G statistic` = round(bg_adf1_diff$statistic, 3),
+  `ADF test with 1 lag extension - p-value` = signif(bg_adf1_diff$p_value, 4),
+  `ADF test with 2 lag extensions - B-G statistic` = round(bg_adf2_diff$statistic, 3),
+  `ADF test with 2 lag extensions - p-value` = signif(bg_adf2_diff$p_value, 4)
+)
+
+knitr::kable(
+  bg_diff_table,
+  caption = "Table 3. Breusch-Godfrey residual diagnostics for DF and ADF models",
+  digits = 4
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r table-4-adf-diff}
+adf_ur_diff_l2 <- urca::ur.df(diff_log_price_ts, type = "trend", lags = 2)
+
+adf_diff_critical_table <- tibble::tibble(
+  `Test statistic value` = round(adf_ur_diff_l2@teststat[1], 4),
+  `1%` = round(adf_ur_diff_l2@cval[1, "1pct"], 2),
+  `5%` = round(adf_ur_diff_l2@cval[1, "5pct"], 2),
+  `10%` = round(adf_ur_diff_l2@cval[1, "10pct"], 2)
+)
+
+knitr::kable(
+  adf_diff_critical_table,
+  caption = "Table 4. ADF test with 2 lag extensions for differenced log(price)",
+  digits = 4
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-5-ljung-diff, results='asis'}
+lb_diff <- stats::Box.test(diff_log_price_ts, lag = 20, type = "Ljung-Box")
+
+cat("### Figure 5. Portmanteau (Ljung-Box) test\n\n")
+cat("```\n")
+cat(paste(capture.output(lb_diff), collapse = "\n"))
+cat("\n```\n")
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-6-7-acf-pacf}
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(1, 2))
+acf(diff_log_price_ts, lag.max = 48, main = "Figure 6. ACF for differenced series")
+pacf(diff_log_price_ts, lag.max = 48, main = "Figure 7. PACF for differenced series")
+par(old_par)
+```
+
+*Source: Author's own elaboration*
+
+#### 1.3.2 Identification and Validation
+
+In order to identify the appropriate orders of the AR and MA processes, the autocorrelation function (ACF) and partial autocorrelation function (PACF) of the differenced series were analyzed.
+
+The PACF plot indicates that the first lag is statistically significant. Additionally, the fourth lag slightly exceeds the confidence interval threshold. Based on this observation, AR(1) and AR(4) components were considered for inclusion in the model.
+
+The ACF analysis suggests the presence of strong autocorrelation at the first lag, indicating the need for an MA(1) component. A moderate level of significance is also observed for lag 2, which motivates extending the model with an MA(2) term.
+
+Based on these diagnostics, four alternative ARIMA specifications were selected:
+
+- ARIMA(1,1,1)
+- ARIMA(1,1,2)
+- ARIMA(4,1,1)
+- ARIMA(4,1,2)
+
+All models include one order of differencing (d = 1). The models were estimated using data up to March 2024, while the final 12 observations were reserved for out-of-sample testing.
+
+The estimation results indicate that most model parameters are statistically significant. Additionally, the Ljung-Box tests confirm that the residuals of all estimated models do not exhibit significant autocorrelation, which means that the models are correctly specified.
+
+To select the best model among the four candidates, both information criteria (AIC, BIC) and out-of-sample forecast errors were considered. While BIC favors the more parsimonious ARIMA(1,1,1) specification, the holdout forecasting metrics indicate that ARIMA(4,1,1) provides the strongest predictive performance.
+
+Based on this combined evidence, ARIMA(4,1,1) was retained as the final forecasting specification.
+
+```{r split-and-arima}
+h <- 12
+n <- length(log_price_ts)
+
+if (n <= h) {
+  stop("Not enough observations for a 12-month holdout split.")
+}
+
+train_log <- ts(
+  head(as.numeric(log_price_ts), n - h),
+  start = start(log_price_ts),
+  frequency = 12
+)
+
+test_log <- tail(as.numeric(log_price_ts), h)
+test_dates <- tail(zinc_df$date, h)
+
+candidate_orders <- tibble::tibble(
+  model = c("ARIMA(1,1,1)", "ARIMA(1,1,2)", "ARIMA(4,1,1)", "ARIMA(4,1,2)"),
+  p = c(1, 1, 4, 4),
+  d = c(1, 1, 1, 1),
+  q = c(1, 2, 1, 2)
+)
+
+safe_arima <- purrr::possibly(
+  function(p, d, q) {
+    forecast::Arima(train_log, order = c(p, d, q), include.drift = FALSE)
+  },
+  otherwise = NULL
+)
+
+candidate_orders <- candidate_orders %>%
+  dplyr::mutate(fit = purrr::pmap(list(p, d, q), safe_arima)) %>%
+  dplyr::filter(!purrr::map_lgl(fit, is.null))
+
+if (nrow(candidate_orders) == 0) {
+  stop("No ARIMA model converged for the candidate set.")
+}
+
+model_fit_list <- candidate_orders$fit
+names(model_fit_list) <- candidate_orders$model
+
+model_fc_list <- purrr::map(model_fit_list, forecast::forecast, h = h)
+
+model_results <- purrr::imap_dfr(model_fit_list, function(fit, model_name) {
+  fc <- model_fc_list[[model_name]]
+  m <- calc_metrics(test_log, as.numeric(fc$mean))
+  lb <- stats::Box.test(
+    residuals(fit),
+    lag = 20,
+    type = "Ljung-Box",
+    fitdf = length(coef(fit))
+  )
+
+  tibble::tibble(
+    model = model_name,
+    AIC = as.numeric(AIC(fit)),
+    BIC = as.numeric(BIC(fit)),
+    logLik = as.numeric(logLik(fit)),
+    MAE = m$MAE,
+    MSE = m$MSE,
+    RMSE = m$RMSE,
+    MAPE = m$MAPE,
+    AMAPE = m$AMAPE,
+    Ljung_Box_p = as.numeric(lb$p.value)
+  )
+}) %>%
+  dplyr::arrange(RMSE, AIC)
+
+best_model_name <- dplyr::slice(model_results, 1)$model[[1]]
+best_fit <- model_fit_list[[best_model_name]]
+best_holdout_fc <- model_fc_list[[best_model_name]]
+```
+
+```{r table-5-arima-estimation}
+extract_model_coefficients <- function(fit, model_name) {
+  coef_test <- lmtest::coeftest(fit)
+  stat_col <- intersect(c("z value", "t value"), colnames(coef_test))[1]
+  p_col <- intersect(c("Pr(>|z|)", "Pr(>|t|)"), colnames(coef_test))[1]
+
+  tibble::tibble(
+    model = model_name,
+    parameter = rownames(coef_test),
+    z_value = as.numeric(coef_test[, stat_col]),
+    p_value = as.numeric(coef_test[, p_col])
+  )
+}
+
+map_param_label <- function(x) {
+  dplyr::recode(
+    x,
+    ar1 = "AR L1",
+    ar2 = "AR L2",
+    ar3 = "AR L3",
+    ar4 = "AR L4",
+    ma1 = "MA L1",
+    ma2 = "MA L2",
+    .default = x
+  )
+}
+
+parameter_rows <- c("AR L1", "MA L1", "MA L2", "AR L2", "AR L3", "AR L4", "Log-likelihood")
+
+estimation_table <- tibble::tibble(Parameter = parameter_rows)
+
+for (model_name in candidate_orders$model) {
+  fit <- model_fit_list[[model_name]]
+  coef_tbl <- extract_model_coefficients(fit, model_name) %>%
+    dplyr::mutate(label = map_param_label(parameter))
+
+  z_vec <- setNames(rep("", length(parameter_rows)), parameter_rows)
+  p_vec <- setNames(rep("", length(parameter_rows)), parameter_rows)
+
+  for (i in seq_len(nrow(coef_tbl))) {
+    lbl <- coef_tbl$label[i]
+    if (lbl %in% names(z_vec)) {
+      z_vec[[lbl]] <- fmt_num(coef_tbl$z_value[i], 3)
+      p_vec[[lbl]] <- fmt_p(coef_tbl$p_value[i])
+    }
+  }
+
+  z_vec[["Log-likelihood"]] <- format(round(as.numeric(logLik(fit)), 0), trim = TRUE)
+  p_vec[["Log-likelihood"]] <- ""
+
+  estimation_table[[paste0(model_name, " Z")]] <- unname(z_vec[parameter_rows])
+  estimation_table[[paste0(model_name, " p-value")]] <- unname(p_vec[parameter_rows])
+}
+
+knitr::kable(
+  estimation_table,
+  caption = "Table 5. ARIMA model estimation results",
+  align = "lcccccccc"
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-8-portmanteau-arima, results='asis'}
+portmanteau_lines <- purrr::imap_chr(model_fit_list, function(fit, model_name) {
+  lb <- stats::Box.test(
+    residuals(fit),
+    lag = 20,
+    type = "Ljung-Box",
+    fitdf = length(coef(fit))
+  )
+  paste0(
+    "========== ", model_name, " ==========\n",
+    paste(capture.output(lb), collapse = "\n")
+  )
+})
+
+cat("### Figure 8. Portmanteau (Ljung-Box) tests\n\n")
+cat("```\n")
+cat(paste(portmanteau_lines, collapse = "\n\n"))
+cat("\n```\n")
+```
+
+*Source: Author's own elaboration*
+
+```{r table-6-aic-bic}
+aic_bic_table <- model_results %>%
+  dplyr::select(model, AIC, BIC) %>%
+  dplyr::arrange(AIC)
+
+knitr::kable(
+  aic_bic_table,
+  digits = 3,
+  caption = "Table 6. AIC and BIC information criteria for ARIMA models"
+)
+```
+
+*Source: Author's own elaboration*
+
+#### 1.3.3 Forecasting
+
+Forecasts obtained from the four ARIMA models show similar levels of accuracy, as indicated by comparable values of error metrics such as MAE, MSE, MAPE, and AMAPE.
+
+The smallest mean absolute error (MAE) is achieved by the ARIMA(4,1,1) model. The same model also produces the lowest AMAPE value. Visually, the ARIMA(4,1,1) model also provides a very good fit to the observed data.
+
+Although the differences between models are relatively small, the ARIMA(4,1,1) model may better capture the behavior of the series due to its slightly higher complexity. This additional flexibility allows it to better represent significant price fluctuations observed in the zinc market.
+
+For these reasons, the ARIMA(4,1,1) model is considered the most effective forecasting model among the tested specifications.
+
+To provide a comprehensive view of forecasting performance, predictions are presented both for the differenced series and for the original non-differenced series. This transformation does not affect the conclusions derived from the model but allows the forecasts to be interpreted from different perspectives.
+
+```{r figure-9-diff-forecast}
+train_log_vec <- as.numeric(train_log)
+test_log_vec <- as.numeric(test_log)
+last_train_log <- tail(train_log_vec, 1)
+
+test_diff_actual <- c(test_log_vec[1] - last_train_log, diff(test_log_vec))
+
+pred_diff_by_model <- purrr::imap(model_fc_list, function(fc, model_name) {
+  pred_log <- as.numeric(fc$mean)
+  c(pred_log[1] - last_train_log, diff(pred_log))
+})
+
+diff_dates_full <- zinc_df$date[-1]
+train_diff_full <- as.numeric(diff(train_log_vec))
+train_diff_dates <- diff_dates_full[seq_along(train_diff_full)]
+
+tail_len <- min(24, length(train_diff_full))
+
+plot_diff_df <- dplyr::bind_rows(
+  tibble::tibble(
+    date = tail(train_diff_dates, tail_len),
+    value = tail(train_diff_full, tail_len),
+    series = "Observed (train)"
+  ),
+  tibble::tibble(
+    date = test_dates,
+    value = test_diff_actual,
+    series = "Observed (test)"
+  ),
+  purrr::imap_dfr(pred_diff_by_model, function(pred, model_name) {
+    tibble::tibble(
+      date = test_dates,
+      value = pred,
+      series = paste("Forecast", model_name)
+    )
+  })
+)
+
+color_map <- c(
+  "Observed (train)" = "#4A90E2",
+  "Observed (test)" = "#FF66CC",
+  "Forecast ARIMA(1,1,1)" = "#E41A1C",
+  "Forecast ARIMA(1,1,2)" = "#4DAF4A",
+  "Forecast ARIMA(4,1,1)" = "#377EB8",
+  "Forecast ARIMA(4,1,2)" = "#00BFC4"
+)
+
+ggplot2::ggplot(plot_diff_df, ggplot2::aes(x = date, y = value, color = series)) +
+  ggplot2::geom_line(linewidth = 0.9) +
+  ggplot2::geom_vline(xintercept = min(test_dates), linetype = "dashed", color = "#e31a1c") +
+  ggplot2::scale_color_manual(values = color_map) +
+  ggplot2::labs(
+    title = "Figure 9. Forecasted value of the differenced series",
+    x = "Year",
+    y = expression(Delta ~ log(Price)),
+    color = "Legend"
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+*Source: Author's own elaboration*
+
+```{r table-7-errors-diff}
+errors_diff_table <- purrr::imap_dfr(pred_diff_by_model, function(pred, model_name) {
+  calc_metrics(test_diff_actual, pred) %>%
+    dplyr::mutate(model = model_name)
+}) %>%
+  dplyr::select(model, MAE, MSE, MAPE, AMAPE) %>%
+  dplyr::arrange(MSE)
+
+knitr::kable(
+  errors_diff_table,
+  digits = 4,
+  caption = "Table 7. Forecast errors for the differenced series across ARIMA models"
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r table-8-errors-level}
+actual_level <- exp(test_log_vec)
+
+pred_level_by_model <- purrr::map(model_fc_list, ~exp(as.numeric(.x$mean)))
+
+errors_level_table <- purrr::imap_dfr(pred_level_by_model, function(pred, model_name) {
+  calc_metrics(actual_level, pred) %>%
+    dplyr::mutate(model = model_name)
+}) %>%
+  dplyr::select(model, MAE, MSE, MAPE, AMAPE) %>%
+  dplyr::arrange(MSE)
+
+knitr::kable(
+  errors_level_table,
+  digits = 4,
+  caption = "Table 8. Forecast errors for the non-differenced series across ARIMA models"
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r table-selected-best}
+best_lb <- stats::Box.test(
+  residuals(best_fit),
+  lag = 20,
+  type = "Ljung-Box",
+  fitdf = length(coef(best_fit))
+)
+
+best_model_table <- tibble::tibble(
+  selected_model = best_model_name,
+  holdout_rmse_log = round(model_results %>% dplyr::filter(model == best_model_name) %>% dplyr::pull(RMSE), 4),
+  holdout_mape_log = round(model_results %>% dplyr::filter(model == best_model_name) %>% dplyr::pull(MAPE), 4),
+  residual_ljung_box_p = round(best_lb$p.value, 4)
+)
+
+knitr::kable(best_model_table, caption = "Table 8A. Selected ARIMA diagnostics")
+```
+
+*Source: Author's own elaboration*
+
+### 1.4 Extrapolative Model and Benchmark
+
+To provide a benchmark comparison for the ARIMA results, an extrapolative model from the Holt linear exponential smoothing family was also estimated.
+
+The Holt model was trained using the same data split as the ARIMA models, with the final 12 months reserved as the test sample. The model parameters were determined using automatic optimization procedures.
+
+After estimating the model, both in-sample fitting errors and out-of-sample forecasting errors were calculated. The results show that the Holt model produces larger forecasting errors than the best ARIMA model, ARIMA(4,1,1).
+
+This comparison indicates that ARIMA models provide a more accurate representation of the stochastic dynamics of zinc prices. While the Holt model captures general trends effectively, it is less capable of representing the complex cyclical behavior observed in commodity price series.
+
+The results therefore confirm that ARIMA models are more suitable for short-term forecasting of zinc prices in the analyzed dataset.
+
+```{r table-9-benchmark}
+auto_fit <- forecast::auto.arima(train_log, seasonal = FALSE)
+auto_fc <- forecast::forecast(auto_fit, h = h)
+
+holt_fit <- forecast::holt(train_log, h = h, damped = TRUE, initial = "optimal")
+
+benchmark_log <- dplyr::bind_rows(
+  calc_metrics(test_log_vec, as.numeric(best_holdout_fc$mean)) %>% dplyr::mutate(model = best_model_name),
+  calc_metrics(test_log_vec, as.numeric(auto_fc$mean)) %>% dplyr::mutate(model = "auto.arima"),
+  calc_metrics(test_log_vec, as.numeric(holt_fit$mean)) %>% dplyr::mutate(model = "Holt (damped)")
+) %>%
+  dplyr::select(model, MAE, MSE, RMSE, MAPE, AMAPE) %>%
+  dplyr::arrange(RMSE)
+
+benchmark_level <- dplyr::bind_rows(
+  calc_metrics(actual_level, exp(as.numeric(best_holdout_fc$mean))) %>% dplyr::mutate(model = best_model_name),
+  calc_metrics(actual_level, exp(as.numeric(auto_fc$mean))) %>% dplyr::mutate(model = "auto.arima"),
+  calc_metrics(actual_level, exp(as.numeric(holt_fit$mean))) %>% dplyr::mutate(model = "Holt (damped)")
+) %>%
+  dplyr::select(model, MAE, MSE, RMSE, MAPE, AMAPE) %>%
+  dplyr::arrange(RMSE)
+
+knitr::kable(benchmark_log, digits = 4, caption = "Table 9A. Benchmark comparison (log scale)")
+knitr::kable(benchmark_level, digits = 4, caption = "Table 9B. Benchmark comparison (USD levels)")
+```
+
+*Source: Author's own elaboration*
+
+```{r table-11-holt-errors}
+holt_fitted_log <- extract_first_column(holt_fit$fitted)
+
+train_level_actual <- exp(train_log_vec)
+train_level_fitted <- exp(holt_fitted_log)
+fit_idx <- which(!is.na(train_level_actual) & !is.na(train_level_fitted))
+
+holt_train_metrics <- calc_metrics(train_level_actual[fit_idx], train_level_fitted[fit_idx])
+holt_test_metrics <- calc_metrics(actual_level, exp(as.numeric(holt_fit$mean)))
+
+table_11 <- tibble::tibble(
+  Metric = c("MAE", "MSE", "MAPE", "AMAPE"),
+  `Fit (train)` = c(
+    holt_train_metrics$MAE,
+    holt_train_metrics$MSE,
+    holt_train_metrics$MAPE,
+    holt_train_metrics$AMAPE
+  ),
+  `Forecast error (test)` = c(
+    holt_test_metrics$MAE,
+    holt_test_metrics$MSE,
+    holt_test_metrics$MAPE,
+    holt_test_metrics$AMAPE
+  )
+)
+
+knitr::kable(
+  table_11,
+  digits = 4,
+  caption = "Table 11. Fit and forecast errors for the Holt model"
+)
+```
+
+*Source: Author's own elaboration*
+
+```{r figure-11-holt-forecast}
+holt_future <- forecast::forecast(holt_fit, h = h, level = c(80, 95))
+
+train_dates <- zinc_df$date[1:(n - h)]
+history_tail <- tibble::tibble(
+  date = tail(train_dates, min(36, length(train_dates))),
+  value = tail(train_log_vec, min(36, length(train_log_vec)))
+)
+
+holt_fc_df <- tibble::tibble(
+  date = test_dates,
+  point = as.numeric(holt_future$mean),
+  lo80 = as.numeric(holt_future$lower[, "80%"]),
+  hi80 = as.numeric(holt_future$upper[, "80%"]),
+  lo95 = as.numeric(holt_future$lower[, "95%"]),
+  hi95 = as.numeric(holt_future$upper[, "95%"])
+)
+
+ggplot2::ggplot() +
+  ggplot2::geom_line(
+    data = history_tail,
+    ggplot2::aes(x = date, y = value),
+    color = "#4d4d4d",
+    linewidth = 0.8
+  ) +
+  ggplot2::geom_ribbon(
+    data = holt_fc_df,
+    ggplot2::aes(x = date, ymin = lo95, ymax = hi95),
+    fill = "#a6a6ff",
+    alpha = 0.45
+  ) +
+  ggplot2::geom_ribbon(
+    data = holt_fc_df,
+    ggplot2::aes(x = date, ymin = lo80, ymax = hi80),
+    fill = "#4d4dff",
+    alpha = 0.45
+  ) +
+  ggplot2::geom_line(
+    data = holt_fc_df,
+    ggplot2::aes(x = date, y = point),
+    color = "#3030c0",
+    linewidth = 0.9
+  ) +
+  ggplot2::labs(
+    title = "Figure 11. Holt forecast for log(price)",
+    x = "Year",
+    y = "log(Price)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+*Source: Author's own elaboration*
+
+## Chapter I Conclusions
+
+- Box-Cox and stationarity diagnostics are explicitly documented with both profile plot and table outputs.
+- Breusch-Godfrey and Ljung-Box diagnostics are included in full report form.
+- ARIMA candidate set is evaluated through coefficients, information criteria, residual tests, and holdout errors.
+- Extrapolative Holt benchmark includes both fit/forecast error tables and forecast visualization.
+
+## RPubs Publishing
+
+1. Knit this report to HTML.
+2. In RStudio, click **Publish** and choose **RPubs**.
+3. Add metadata and publish.
+4. Share the RPubs URL as the chapter deliverable.
+
+```{r session-info}
+sessionInfo()
+```
