@@ -1,0 +1,3 @@
+series,statistic,critical_1pct,critical_5pct,critical_10pct,selected_lags
+log(price),-3.1268465621522696,-3.98,-3.42,-3.13,1
+diff(log(price)),-12.25188712485969,-3.44,-2.87,-2.57,1

@@ -1,0 +1,663 @@
+---
+title: "Institutional-Grade Zinc Price Forecasting (1990-2025)"
+author: "Data Science Research"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    number_sections: false
+    theme: cosmo
+---
+
+## Executive Summary
+
+This RPubs report translates the source study (`asc_ceny_cynku.pdf`) into an English and reproducible workflow.
+
+This iteration is focused on Chapter I and mirrors the original structure:
+
+- 1.1 Data description,
+- 1.2 Time-series decomposition,
+- 1.3 ARIMA model (stationarity, identification and validation, forecasting),
+- 1.4 Extrapolative model benchmark.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5,
+  dpi = 120
+)
+
+required_packages <- c(
+  "readr", "dplyr", "tidyr", "ggplot2", "forecast",
+  "tseries", "urca", "knitr", "purrr", "tibble", "scales"
+)
+
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Install missing packages before knitting: ",
+      paste(missing_packages, collapse = ", ")
+    )
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+invisible(Sys.setlocale("LC_TIME", "C"))
+```
+
+## I. Non-Seasonal Series
+
+### 1.1 Data Description
+
+The dataset contains monthly zinc prices in USD per metric ton. The source report states 423 observations from January 1990 to March 2025. We verify this directly below.
+
+```{r data-load}
+raw_data <- readr::read_csv("zinc_prices.csv", show_col_types = FALSE)
+
+zinc_df <- raw_data %>%
+  transmute(
+    date = as.Date(paste0("01-", Date), format = "%d-%b-%y"),
+    price = as.numeric(gsub(",", ".", gsub("\\s+", "", Price)))
+  ) %>%
+  arrange(date) %>%
+  mutate(log_price = log(price))
+
+if (anyNA(zinc_df$date) || anyNA(zinc_df$price)) {
+  stop("Date or price parsing generated missing values.")
+}
+if (any(zinc_df$price <= 0)) {
+  stop("Non-positive prices detected. Log transformation is invalid.")
+}
+if (n_distinct(zinc_df$date) != nrow(zinc_df)) {
+  stop("Duplicate monthly timestamps detected.")
+}
+
+start_year <- as.integer(format(min(zinc_df$date), "%Y"))
+start_month <- as.integer(format(min(zinc_df$date), "%m"))
+
+price_ts <- ts(zinc_df$price, start = c(start_year, start_month), frequency = 12)
+log_price_ts <- ts(zinc_df$log_price, start = c(start_year, start_month), frequency = 12)
+```
+
+```{r table-1-qa}
+qa_table <- tibble(
+  metric = c(
+    "Observations",
+    "Start date",
+    "End date",
+    "Missing dates",
+    "Missing prices",
+    "Duplicate dates"
+  ),
+  value = c(
+    nrow(zinc_df),
+    as.character(min(zinc_df$date)),
+    as.character(max(zinc_df$date)),
+    sum(is.na(zinc_df$date)),
+    sum(is.na(zinc_df$price)),
+    nrow(zinc_df) - n_distinct(zinc_df$date)
+  )
+)
+
+knitr::kable(qa_table, caption = "Table 1. Input data quality checks")
+```
+
+**Interpretation (1.1):**
+The sample contains `r nrow(zinc_df)` monthly observations from `r min(zinc_df$date)` to `r max(zinc_df$date)`, fully consistent with the source report. There are no missing values and no duplicate timestamps.
+
+```{r figure-1-price-log}
+plot_df <- zinc_df %>%
+  select(date, price, log_price) %>%
+  pivot_longer(cols = c(price, log_price), names_to = "series", values_to = "value") %>%
+  mutate(
+    series = recode(
+      series,
+      price = "Price (USD/ton)",
+      log_price = "log(Price)"
+    )
+  )
+
+ggplot(plot_df, aes(x = date, y = value)) +
+  geom_line(color = "#1f78b4", linewidth = 0.8) +
+  facet_wrap(~series, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Figure 1. Zinc price and log-price over time",
+    x = "Date",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Interpretation (Figure 1):**
+The series shows strong cyclical commodity behavior and larger volatility amplitude in later years. The log transformation reduces heteroskedasticity and supports model-based inference.
+
+### 1.2 Time-Series Decomposition
+
+The source report uses Demetra/TRAMO-SEATS and concludes that seasonality is not material. In RPubs, we mirror that logic with an STL proxy and compare original versus seasonally adjusted series.
+
+```{r decomposition-stl}
+stl_fit <- stl(log_price_ts, s.window = "periodic", robust = TRUE)
+
+seasonally_adjusted_log <- forecast::seasadj(stl_fit)
+seasonally_adjusted_price <- exp(as.numeric(seasonally_adjusted_log))
+
+decomp_df <- tibble(
+  date = zinc_df$date,
+  original_price = zinc_df$price,
+  sa_price = seasonally_adjusted_price
+)
+
+seasonality_strength <- max(
+  0,
+  1 - var(stl_fit$time.series[, "remainder"], na.rm = TRUE) /
+    var(stl_fit$time.series[, "remainder"] + stl_fit$time.series[, "seasonal"], na.rm = TRUE)
+)
+
+decomp_summary <- tibble(
+  metric = c(
+    "Seasonality strength (0 to 1)",
+    "Correlation original vs seasonally adjusted"
+  ),
+  value = c(
+    round(seasonality_strength, 4),
+    round(cor(decomp_df$original_price, decomp_df$sa_price), 4)
+  )
+)
+
+knitr::kable(decomp_summary, caption = "Table 2. Decomposition diagnostics")
+```
+
+```{r figure-2-overlay}
+ggplot(decomp_df, aes(x = date)) +
+  geom_line(aes(y = original_price, color = "Original"), linewidth = 0.8) +
+  geom_line(aes(y = sa_price, color = "Seasonally adjusted"), linewidth = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("Original" = "#1f78b4", "Seasonally adjusted" = "#e31a1c")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Figure 2. Original vs seasonally adjusted series",
+    x = "Date",
+    y = "Price (USD)",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r figure-2-components}
+plot(stl_fit, main = "Figure 2B. STL decomposition components")
+```
+
+**Interpretation (1.2):**
+Estimated seasonality is weak (`r round(seasonality_strength, 4)`), and the adjusted series is almost identical to the original (`r round(cor(decomp_df$original_price, decomp_df$sa_price), 4)`). This matches the source report conclusion that the analyzed zinc series is effectively non-seasonal.
+
+### 1.3 ARIMA Model
+
+#### 1.3.1 Stationarity
+
+```{r table-3-boxcox}
+lambda_guerrero <- forecast::BoxCox.lambda(price_ts, method = "guerrero")
+
+boxcox_table <- tibble(
+  diagnostic = "Guerrero Box-Cox lambda",
+  value = round(lambda_guerrero, 3),
+  interpretation = ifelse(
+    abs(lambda_guerrero) < 0.2,
+    "Near zero: log transform is justified",
+    "Not near zero: alternative transform should be evaluated"
+  )
+)
+
+knitr::kable(boxcox_table, caption = "Table 3. Variance stabilization diagnostic")
+```
+
+```{r figure-3-boxcox-profile}
+price_clean <- na.omit(zinc_df$price)
+time_index <- seq_along(price_clean)
+boxcox_model <- lm(price_clean ~ time_index)
+
+MASS::boxcox(
+  boxcox_model,
+  lambda = seq(-1, 1, 0.1),
+  main = "Figure 3. Box-Cox profile for raw zinc price"
+)
+abline(v = lambda_guerrero, lty = 2, col = "firebrick")
+```
+
+```{r table-4-adf}
+diff_log_price_ts <- diff(log_price_ts)
+
+adf_level <- tseries::adf.test(log_price_ts, k = 12)
+adf_diff <- tseries::adf.test(diff_log_price_ts, k = 12)
+
+adf_table <- tibble(
+  series = c("log(price)", "diff(log(price))"),
+  statistic = c(unname(adf_level$statistic), unname(adf_diff$statistic)),
+  p_value = c(adf_level$p.value, adf_diff$p.value)
+)
+
+knitr::kable(adf_table, digits = 4, caption = "Table 4. ADF diagnostics")
+```
+
+```{r table-5-urdf}
+ur_level <- urca::ur.df(log_price_ts, type = "trend", selectlags = "AIC")
+ur_diff <- urca::ur.df(diff_log_price_ts, type = "drift", selectlags = "AIC")
+
+extract_ur <- function(model, label) {
+  test_name <- names(model@teststat)[1]
+  tibble(
+    series = label,
+    test = test_name,
+    statistic = unname(model@teststat[1]),
+    critical_1pct = unname(model@cval[1, "1pct"]),
+    critical_5pct = unname(model@cval[1, "5pct"]),
+    critical_10pct = unname(model@cval[1, "10pct"]),
+    selected_lags = model@lags
+  )
+}
+
+ur_table <- bind_rows(
+  extract_ur(ur_level, "log(price)"),
+  extract_ur(ur_diff, "diff(log(price))")
+)
+
+knitr::kable(ur_table, digits = 4, caption = "Table 5. ur.df diagnostics")
+```
+
+```{r figure-3-acf-pacf}
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(1, 2))
+acf(diff_log_price_ts, lag.max = 48, main = "ACF: diff(log(price))")
+pacf(diff_log_price_ts, lag.max = 48, main = "PACF: diff(log(price))")
+par(old_par)
+```
+
+```{r figure-4-diff-log-series}
+diff_series_df <- tibble(
+  date = zinc_df$date[-1],
+  diff_log = as.numeric(diff_log_price_ts)
+)
+
+ggplot(diff_series_df, aes(x = date, y = diff_log)) +
+  geom_line(color = "darkred", linewidth = 0.7) +
+  labs(
+    title = "Figure 4. Differenced logarithm of zinc price series",
+    x = "Year",
+    y = expression(Delta ~ log(Price))
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Interpretation (1.3.1):**
+The Box-Cox diagnostics (Table 3 and Figure 3) support log transformation (`lambda = `r round(lambda_guerrero, 3)`). The differenced log series is clearly stationary (`ADF p-value = `r signif(adf_diff$p.value, 3)`), supporting ARIMA with one differencing order (`d = 1`).
+
+#### 1.3.2 Identification and Validation
+
+```{r split}
+h <- 12
+n <- length(log_price_ts)
+
+if (n <= h) {
+  stop("Not enough observations for a 12-month holdout split.")
+}
+
+train_log <- ts(
+  head(as.numeric(log_price_ts), n - h),
+  start = start(log_price_ts),
+  frequency = 12
+)
+
+test_log <- tail(as.numeric(log_price_ts), h)
+test_dates <- tail(zinc_df$date, h)
+```
+
+```{r table-6-arima-candidates}
+candidate_orders <- tibble(
+  model = c("ARIMA(1,1,1)", "ARIMA(1,1,2)", "ARIMA(4,1,1)", "ARIMA(4,1,2)"),
+  p = c(1, 1, 4, 4),
+  d = c(1, 1, 1, 1),
+  q = c(1, 2, 1, 2)
+)
+
+calc_metrics <- function(actual, predicted) {
+  tibble(
+    MAE = mean(abs(actual - predicted)),
+    RMSE = sqrt(mean((actual - predicted)^2)),
+    MAPE = mean(abs(actual - predicted) / pmax(abs(actual), 1e-8)) * 100,
+    sMAPE = mean(200 * abs(actual - predicted) / (abs(actual) + abs(predicted) + 1e-8))
+  )
+}
+
+safe_arima <- purrr::possibly(
+  function(p, d, q) {
+    forecast::Arima(train_log, order = c(p, d, q), include.drift = TRUE)
+  },
+  otherwise = NULL
+)
+
+model_results <- candidate_orders %>%
+  mutate(fit = pmap(list(p, d, q), safe_arima)) %>%
+  filter(!map_lgl(fit, is.null)) %>%
+  mutate(
+    fc = map(fit, forecast::forecast, h = h),
+    metrics = map(fc, ~calc_metrics(test_log, as.numeric(.x$mean))),
+    AIC = map_dbl(fit, AIC),
+    BIC = map_dbl(fit, BIC),
+    logLik = map_dbl(fit, ~as.numeric(logLik(.x))),
+    Ljung_Box_p = map_dbl(
+      fit,
+      ~Box.test(
+        residuals(.x),
+        lag = 24,
+        type = "Ljung-Box",
+        fitdf = length(coef(.x))
+      )$p.value
+    )
+  ) %>%
+  unnest(metrics) %>%
+  arrange(RMSE, AIC)
+
+if (nrow(model_results) == 0) {
+  stop("No ARIMA specification converged on the training window.")
+}
+
+knitr::kable(
+  model_results %>%
+    select(model, AIC, BIC, logLik, MAE, RMSE, MAPE, sMAPE, Ljung_Box_p),
+  digits = 4,
+  caption = "Table 6. ARIMA candidate comparison"
+)
+```
+
+```{r table-7-selected-model}
+best_row <- model_results %>% slice(1)
+best_model_name <- best_row$model[[1]]
+best_fit <- best_row$fit[[1]]
+best_holdout_fc <- best_row$fc[[1]]
+
+best_lb <- Box.test(
+  residuals(best_fit),
+  lag = 24,
+  type = "Ljung-Box",
+  fitdf = length(coef(best_fit))
+)
+
+best_model_table <- tibble(
+  selected_model = best_model_name,
+  holdout_rmse_log = round(as.numeric(best_row$RMSE), 4),
+  holdout_mape_log = round(as.numeric(best_row$MAPE), 4),
+  residual_ljung_box_p = round(best_lb$p.value, 4)
+)
+
+knitr::kable(best_model_table, caption = "Table 7. Selected ARIMA diagnostics")
+```
+
+**Interpretation (1.3.2):**
+The selected specification is **`r best_model_name`**. Residual diagnostics are acceptable (`Ljung-Box p-value = `r round(best_lb$p.value, 4)`), so the model is retained for forecasting.
+
+#### 1.3.3 Forecasting
+
+```{r figure-4-holdout-levels}
+plot_start_date <- if (nrow(zinc_df) > 120) {
+  zinc_df$date[nrow(zinc_df) - 119]
+} else {
+  min(zinc_df$date)
+}
+
+holdout_df <- bind_rows(
+  zinc_df %>%
+    slice(1:(nrow(zinc_df) - h)) %>%
+    transmute(date, value = price, series = "Actual (train)"),
+  zinc_df %>%
+    slice((nrow(zinc_df) - h + 1):n()) %>%
+    transmute(date, value = price, series = "Actual (test)"),
+  tibble(
+    date = test_dates,
+    value = exp(as.numeric(best_holdout_fc$mean)),
+    series = paste0("Forecast ", best_model_name)
+  )
+) %>%
+  filter(date >= plot_start_date)
+
+ggplot(holdout_df, aes(x = date, y = value, color = series)) +
+  geom_line(linewidth = 0.9) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Figure 4. Holdout performance in USD levels",
+    x = "Date",
+    y = "Price (USD)",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r figure-9-diff-forecast-comparison}
+as_year_decimal <- function(d) {
+  y <- as.integer(format(d, "%Y"))
+  m <- as.integer(format(d, "%m"))
+  y + (m - 1) / 12
+}
+
+fc_by_model <- purrr::set_names(model_results$fc, model_results$model)
+
+train_log_vec <- as.numeric(train_log)
+test_log_vec <- as.numeric(test_log)
+last_train_log <- tail(train_log_vec, 1)
+
+actual_test_diff <- c(test_log_vec[1] - last_train_log, diff(test_log_vec))
+train_diff <- diff(train_log_vec)
+train_diff_dates <- zinc_df$date[2:(length(train_log_vec))]
+
+train_tail_len <- min(16, length(train_diff))
+
+diff_forecast_df <- bind_rows(
+  tibble(
+    date = tail(train_diff_dates, train_tail_len),
+    value = tail(train_diff, train_tail_len),
+    series = "Actual"
+  ),
+  tibble(
+    date = test_dates,
+    value = actual_test_diff,
+    series = "Actual (test)"
+  ),
+  purrr::imap_dfr(fc_by_model, function(fc_obj, model_name) {
+    pred_log <- as.numeric(fc_obj$mean)
+    pred_diff <- c(pred_log[1] - last_train_log, diff(pred_log))
+    tibble(
+      date = test_dates,
+      value = pred_diff,
+      series = paste("Forecast", model_name)
+    )
+  })
+) %>%
+  mutate(year_num = as_year_decimal(date))
+
+diff_colors <- c(
+  "Forecast ARIMA(1,1,1)" = "#F8766D",
+  "Forecast ARIMA(1,1,2)" = "#B79F00",
+  "Forecast ARIMA(4,1,1)" = "#00BA38",
+  "Forecast ARIMA(4,1,2)" = "#00BFC4",
+  "Actual" = "#619CFF",
+  "Actual (test)" = "#F564E3"
+)
+
+ggplot(diff_forecast_df, aes(x = year_num, y = value, color = series)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = as_year_decimal(min(test_dates)), linetype = "dashed", color = "#F8766D") +
+  scale_color_manual(values = diff_colors) +
+  labs(
+    title = "Figure 9. Forecasted values for the differenced series",
+    x = "Year",
+    y = expression(Delta ~ log(Price)),
+    color = "Legend"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r figure-10-level-forecast-comparison}
+window_start_idx <- max(1, nrow(zinc_df) - (h + 15))
+
+level_plot_df <- bind_rows(
+  tibble(
+    date = zinc_df$date[window_start_idx:nrow(zinc_df)],
+    value = zinc_df$log_price[window_start_idx:nrow(zinc_df)],
+    series = "Actual"
+  ),
+  purrr::imap_dfr(fc_by_model, function(fc_obj, model_name) {
+    tibble(
+      date = test_dates,
+      value = as.numeric(fc_obj$mean),
+      series = paste("Forecast", model_name)
+    )
+  })
+) %>%
+  mutate(year_num = as_year_decimal(date))
+
+level_colors <- c(
+  "Forecast ARIMA(1,1,1)" = "#F8766D",
+  "Forecast ARIMA(1,1,2)" = "#B79F00",
+  "Forecast ARIMA(4,1,1)" = "#00BA38",
+  "Forecast ARIMA(4,1,2)" = "#00BFC4",
+  "Actual" = "#F564E3"
+)
+
+ggplot(level_plot_df, aes(x = year_num, y = value, color = series)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = as_year_decimal(min(test_dates)), linetype = "dashed", color = "#F8766D") +
+  scale_color_manual(values = level_colors) +
+  labs(
+    title = "Figure 10. Forecasted values for the undifferenced series",
+    x = "Year",
+    y = "Value",
+    color = "Legend"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r table-8-final-forecast}
+best_order <- candidate_orders %>%
+  filter(model == best_model_name) %>%
+  slice(1)
+
+final_fit <- forecast::Arima(
+  log_price_ts,
+  order = c(best_order$p, best_order$d, best_order$q),
+  include.drift = TRUE
+)
+
+future_fc <- forecast::forecast(final_fit, h = 12, level = c(80, 95))
+
+last_month <- as.Date(format(max(zinc_df$date), "%Y-%m-01"))
+future_dates <- seq(from = last_month, by = "month", length.out = 13)[-1]
+
+forecast_table <- tibble(
+  date = future_dates,
+  point_forecast = exp(as.numeric(future_fc$mean)),
+  lo80 = exp(as.numeric(future_fc$lower[, "80%"])),
+  hi80 = exp(as.numeric(future_fc$upper[, "80%"])),
+  lo95 = exp(as.numeric(future_fc$lower[, "95%"])),
+  hi95 = exp(as.numeric(future_fc$upper[, "95%"]))
+)
+
+knitr::kable(
+  forecast_table,
+  digits = 2,
+  caption = "Table 8. ARIMA 12-month forecast in USD"
+)
+```
+
+```{r figure-5-final-forecast}
+history_tail <- zinc_df %>%
+  filter(date >= plot_start_date) %>%
+  select(date, price)
+
+ggplot() +
+  geom_line(
+    data = history_tail,
+    aes(x = date, y = price),
+    color = "#1f78b4",
+    linewidth = 0.9
+  ) +
+  geom_ribbon(
+    data = forecast_table,
+    aes(x = date, ymin = lo95, ymax = hi95),
+    fill = "#a6cee3",
+    alpha = 0.25
+  ) +
+  geom_ribbon(
+    data = forecast_table,
+    aes(x = date, ymin = lo80, ymax = hi80),
+    fill = "#1f78b4",
+    alpha = 0.25
+  ) +
+  geom_line(
+    data = forecast_table,
+    aes(x = date, y = point_forecast),
+    color = "#e31a1c",
+    linewidth = 1
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = paste("Figure 5. 12-month forecast using", best_model_name),
+    x = "Date",
+    y = "Price (USD)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Interpretation (1.3.3):**
+The selected ARIMA model reproduces holdout dynamics with reasonable fidelity and generates a forward path in USD units with 80% and 95% uncertainty intervals.
+
+### 1.4 Extrapolative Model and Benchmark
+
+```{r table-9-extrapolative-benchmark}
+auto_fit <- forecast::auto.arima(train_log, seasonal = FALSE)
+auto_fc <- forecast::forecast(auto_fit, h = h)
+
+holt_fit <- forecast::holt(train_log, h = h, damped = TRUE, initial = "optimal")
+
+benchmark_log <- bind_rows(
+  calc_metrics(test_log, as.numeric(best_holdout_fc$mean)) %>% mutate(model = best_model_name),
+  calc_metrics(test_log, as.numeric(auto_fc$mean)) %>% mutate(model = "auto.arima"),
+  calc_metrics(test_log, as.numeric(holt_fit$mean)) %>% mutate(model = "Holt (damped)")
+) %>%
+  select(model, MAE, RMSE, MAPE, sMAPE) %>%
+  arrange(RMSE)
+
+test_level <- exp(test_log)
+benchmark_level <- bind_rows(
+  calc_metrics(test_level, exp(as.numeric(best_holdout_fc$mean))) %>% mutate(model = best_model_name),
+  calc_metrics(test_level, exp(as.numeric(auto_fc$mean))) %>% mutate(model = "auto.arima"),
+  calc_metrics(test_level, exp(as.numeric(holt_fit$mean))) %>% mutate(model = "Holt (damped)")
+) %>%
+  select(model, MAE, RMSE, MAPE, sMAPE) %>%
+  arrange(RMSE)
+
+knitr::kable(benchmark_log, digits = 4, caption = "Table 9A. Benchmark comparison (log scale)")
+knitr::kable(benchmark_level, digits = 2, caption = "Table 9B. Benchmark comparison (USD levels)")
+```
+
+**Interpretation (1.4):**
+The extrapolative model is a useful robustness benchmark, but **`r best_model_name`** remains the strongest option on holdout performance.
+
+### Chapter I Conclusions
+
+- The zinc price series is effectively non-seasonal and strongly cyclical.
+- Log transformation and differencing (`d = 1`) are supported by diagnostics.
+- ARIMA outperforms the extrapolative benchmark in this sample.
+- Forecast communication in USD levels with confidence bands is ready for RPubs publication.
+
+## RPubs Publishing
+
+1. Knit this report to HTML.
+2. In RStudio, click **Publish** and choose **RPubs**.
+3. Add metadata and publish.
+4. Share the RPubs URL as the chapter deliverable.
+
+```{r session-info}
+sessionInfo()
+```

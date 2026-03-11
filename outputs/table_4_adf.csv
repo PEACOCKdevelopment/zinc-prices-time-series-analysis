@@ -1,0 +1,3 @@
+series,statistic,p_value
+log(price),-3.5545993777852996,0.0373577521360289
+diff(log(price)),-5.62652046821098,0.01
