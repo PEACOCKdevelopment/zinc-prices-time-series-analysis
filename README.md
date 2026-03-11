@@ -75,7 +75,8 @@ The pipeline exports a complete artifact set into outputs/, including:
 - benchmark comparison tables in both log and level scales,
 - diagnostic and forecast figures (ACF/PACF, decomposition, holdout fit, forecast intervals).
 
-## Key Findings (Current Report)
+## Key Findings
+
 
 - The series shows strong cyclical behavior with weak seasonal influence.
 - After transformation/differencing, ARIMA assumptions are better supported.
