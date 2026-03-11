@@ -1,0 +1,10 @@
+# Local R session artifacts
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio project metadata
+.Rproj.user/
+
+# RPubs / Posit Connect deployment metadata
+rsconnect/
